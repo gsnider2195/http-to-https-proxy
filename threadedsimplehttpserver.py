@@ -18,6 +18,9 @@ class ProxyHTTPRequestHandler(ThreadingMixIn, BaseHTTPRequestHandler):
 
         print("DEBUG: %s" % (format % args), file=sys.stderr)
 
+    def _send_header(self, format, *args):
+        self.wfile.write(((format % args) + "\r\n").encode("latin-1", "strict"))
+
     def handle_one_request(self):
         """Handle a single HTTP request and proxy it to the HTTPS version of the site."""
         try:
@@ -51,25 +54,42 @@ class ProxyHTTPRequestHandler(ThreadingMixIn, BaseHTTPRequestHandler):
             if body:
                 req.body = body
             s = requests.Session()
-            resp = s.send(req, proxies=REQUESTS_PROXIES, allow_redirects=False)
+            chunked = self.request_version == "HTTP/1.1" # Try to chunk requests if client supports HTTP/1.1
+            resp = s.send(req, proxies=REQUESTS_PROXIES, allow_redirects=False, stream=chunked)
+
+            if resp.headers.get("content-length", "0") == "0":
+                chunked = False
 
             self._log_debug("received response from: %s", url)
             self._log_debug("response headers: %s", resp.headers)
 
             # Send first line of HTTP Headers
             http_version = "%s.%s" % (str(resp.raw.version)[0], str(resp.raw.version)[1])
-            self.wfile.write(("HTTP/%s %s %s\r\n" % (http_version, resp.status_code, resp.reason)).encode("latin-1", "strict"))
+            self._send_header("HTTP/%s %s %s", http_version, resp.status_code, resp.reason)
 
             # Replace https:// in content with http://
             # Some sites use https:&#x2F;&#x2F; instead of https://
             if resp.headers.get("content-type", "").lower().startswith("text"):
+                content = b""
+                if chunked:
+                    chunked = False  # Do not chunk text because we need access to the full content to replace https strings
+                    for chunk in resp.iter_content(chunk_size=None):
+                        content += chunk
+                else:
+                    content = resp.content
+
+                # Decode the content and replace strings
                 encoding = "utf-8"
                 if "charset=" in resp.headers.get("content-type", ""):
                     encoding = resp.headers.get("content-type").split("charset=")[1]
-                content = resp.content.decode(encoding, "replace")
+                content = content.decode(encoding, "replace")
                 content = content.replace("https://", "http://")
-                content = content.replace("https:&#x2F;&#x2F;", "http:&#x2F;&#x2F;").encode(encoding)
-            else:
+                content = content.replace("https:&#x2F;&#x2F;", "http:&#x2F;&#x2F;")
+
+                # Re-encode the content before returning to the client
+                content = content.encode(encoding)
+
+            elif not chunked:
                 content = resp.content
 
             # Send the rest of the headers from proxied request
@@ -78,26 +98,42 @@ class ProxyHTTPRequestHandler(ThreadingMixIn, BaseHTTPRequestHandler):
             for k, v in resp.headers.items():
                 if k.lower() == "content-encoding":
                     continue
-                if k.lower() == "transfer-encoding" and v.lower() == "chunked":
-                    self.wfile.write(("Content-Length: %s\r\n" % (len(content))).encode("latin-1", "strict"))
-                elif k.lower() == "content-length":
-                    self.wfile.write(("Content-Length: %s\r\n" % (len(content))).encode("latin-1", "strict"))
+                if k.lower() == "transfer-encoding" and "chunked" in v.lower() and not chunked:
+                    self._send_header("Content-Length: %s", len(content))
+                elif k.lower() == "content-length" and not chunked:
+                    self._send_header("Content-Length: %s", len(content))
                 else:
                     v = v.replace("https://", "http://")
-                    self.wfile.write(("%s: %s\r\n" % (k, v)).encode("latin-1", "strict"))
+                    self._send_header("%s: %s", k, v)
 
-            self._log_debug("return content length: %s", len(content))
-            if resp.headers.get("content-type", "").lower().startswith("text"):
-                self._log_debug(content.replace(b"%", b"%%"))
+            if chunked:
+                if "transfer-encoding" not in resp.headers:
+                    self._send_header("Transfer-Encoding: chunked")
 
-            # Send the content
-            self.wfile.write(b"\r\n")
-            self.wfile.write(content)
+                self._log_debug("returning chunked content")
+                self._send_header("")
+
+                for chunk in resp.iter_content(chunk_size=None):
+                    self._send_header("%X", len(chunk))
+                    self.wfile.write(chunk)
+                    self._send_header("")
+                    self.wfile.flush()
+
+                self._send_header("0\r\n")
+
+            else:
+                self._log_debug("return content length: %s", len(content))
+                if resp.headers.get("content-type", "").lower().startswith("text") and not chunked:
+                    self._log_debug(content.replace(b"%", b"%%"))
+
+                # Send the content
+                self._send_header("")
+                self.wfile.write(content)
 
             self.wfile.flush() #actually send the response if not already done.
 
             # Log the response information
-            self.log_message('"%s" %s %s', self.requestline.strip(), resp.status_code, len(content))
+            self.log_message('"%s" %s %s', self.requestline.strip(), resp.status_code, resp.headers.get("content-length", "-"))
 
         except TimeoutError as e:
             # a read or a write timed out.  Discard this connection
