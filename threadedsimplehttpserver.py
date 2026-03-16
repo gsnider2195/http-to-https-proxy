@@ -10,7 +10,7 @@ LISTEN_PORT = 5000
 REQUESTS_PROXIES = {"http": None, "https": None}
 
 
-class ProxyHTTPRequestHandler(ThreadingMixIn, BaseHTTPRequestHandler):
+class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def _log_debug(self, format, *args):
         if "--debug" not in sys.argv:
@@ -142,8 +142,11 @@ class ProxyHTTPRequestHandler(ThreadingMixIn, BaseHTTPRequestHandler):
             return 
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Backport from Python 3.7"""
+
 server_address = ("", LISTEN_PORT)
-httpd = HTTPServer(server_address, ProxyHTTPRequestHandler)
+httpd = ThreadingHTTPServer(server_address, ProxyHTTPRequestHandler)
 print("Starting server on port %s" % (LISTEN_PORT), file=sys.stderr)
 try:
     httpd.serve_forever()
